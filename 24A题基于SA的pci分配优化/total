@@ -1,0 +1,969 @@
+import numpy as np
+import pandas as pd
+from scipy.sparse import csr_matrix
+import random
+import math
+import copy
+from collections import defaultdict
+
+# ============================================================
+# 第一部分：数据预处理与冲突度统计
+# ============================================================
+
+class DataPreprocessor:
+    """数据预处理：读取冲突、混淆、干扰矩阵，构建稀疏矩阵"""
+    
+    def __init__(self, num_cells=2067, num_pci=1008):
+        self.num_cells = num_cells
+        self.num_pci = num_pci  # PCI取值 0~1007
+        self.conflict_matrix = None  # 冲突矩阵 A
+        self.confusion_matrix = None  # 混淆矩阵 B
+        self.interference_matrix = None  # 干扰矩阵 C
+        self.cell_ids = []  # 小区ID列表
+        self.cell_id_to_idx = {}  # 小区ID到索引的映射
+    
+    def load_data(self, conflict_file, confusion_file, interference_file, cell_list_file=None):
+        """
+        加载数据文件
+        conflict_file: 冲突及干扰矩阵数据 (小区, 邻小区, 冲突MR, 干扰MR)
+        confusion_file: 混淆矩阵数据 (小区, 邻小区, 混淆MR)
+        cell_list_file: 优化小区列表
+        """
+        # 读取优化小区列表
+        if cell_list_file:
+            cell_df = pd.read_csv(cell_list_file)
+            #通过pandas读文件并把返回值赋给cell_df，cell_df是一个DataFrame对象
+            self.cell_ids = cell_df.iloc[:, 0].tolist()
+            #把DataFrame对象的第一列（iloc[:, 0]）转换成列表（tolist()），是因为后续需要使用这个列表来构建小区ID到索引的映射
+        else:
+            self.cell_ids = list(range(self.num_cells))
+            #如果没有提供小区列表文件，就默认使用0到num_cells-1的整数作为小区ID列表，因为题目中提到小区数量为2067，所以默认小区ID就是0到2066的整数列表
+        
+        self.cell_id_to_idx = {cid: idx for idx, cid in enumerate(self.cell_ids)}
+        #给id到索引的映射，通过enumerate函数遍历cell_ids列表，获取每个小区ID（cid）和对应的索引（idx），然后构建一个字典（cell_id_to_idx）来存储这个映射关系，方便后续根据小区ID快速找到对应的索引位置
+        n = len(self.cell_ids)
+        #n是小区数量，通过计算cell_ids列表的长度来获取，因为后续需要构建n x n的矩阵，所以需要知道小区的数量
+        self.num_cells = n
+        #更新num_cells属性为实际的小区数量，以确保后续矩阵构建和索引映射的正确性
+                
+        # 初始化稀疏矩阵数据
+        #使用defaultdict函数的原因是，避免键不存在的KeyError，方便后续矩阵补零
+        conflict_data = defaultdict(float)#使用defaultdict来存储冲突数据，键是小区对(i, j)，值是对应的冲突MR，默认值为0.0
+        confusion_data = defaultdict(float)
+        interference_data = defaultdict(float)
+        
+        # 读取冲突及干扰数据
+        cf_df = pd.read_csv(conflict_file)
+        for _, row in cf_df.iterrows():
+            cell_i = row.iloc[0]#
+            cell_j = row.iloc[1]
+            if cell_i in self.cell_id_to_idx and cell_j in self.cell_id_to_idx:
+                i = self.cell_id_to_idx[cell_i]
+                j = self.cell_id_to_idx[cell_j]
+                conflict_data[(i, j)] = row.iloc[2]  # 冲突MR
+                interference_data[(i, j)] = row.iloc[3]  # 干扰MR
+        
+        # 读取混淆数据
+        cn_df = pd.read_csv(confusion_file)
+        for _, row in cn_df.iterrows():
+            cell_i = row.iloc[0]
+            cell_j = row.iloc[1]
+            if cell_i in self.cell_id_to_idx and cell_j in self.cell_id_to_idx:
+                i = self.cell_id_to_idx[cell_i]
+                j = self.cell_id_to_idx[cell_j]
+                confusion_data[(i, j)] = row.iloc[2]
+        
+        # 补全：混淆矩阵有但冲突矩阵没有的
+        for (i, j), v in confusion_data.items():
+            if (i, j) not in conflict_data:
+                conflict_data[(i, j)] = 0
+                interference_data[(i, j)] = 0
+        
+        for (i, j), v in conflict_data.items():
+            if (i, j) not in confusion_data:
+                confusion_data[(i, j)] = 0
+        
+        # 构建稀疏矩阵
+        rows_c, cols_c, vals_c = [], [], []
+        rows_n, cols_n, vals_n = [], [], []
+        rows_i, cols_i, vals_i = [], [], []
+        
+        for (i, j), v in conflict_data.items():
+            rows_c.append(i); cols_c.append(j); vals_c.append(v)
+        for (i, j), v in confusion_data.items():
+            rows_n.append(i); cols_n.append(j); vals_n.append(v)
+        for (i, j), v in interference_data.items():
+            rows_i.append(i); cols_i.append(j); vals_i.append(v)
+        
+        self.conflict_matrix = csr_matrix((vals_c, (rows_c, cols_c)), shape=(n, n))
+        self.confusion_matrix = csr_matrix((vals_n, (rows_n, cols_n)), shape=(n, n))
+        self.interference_matrix = csr_matrix((vals_i, (rows_i, cols_i)), shape=(n, n))
+    
+    def load_data_from_arrays(self, A, B, C):
+        """直接从numpy数组加载（用于测试）"""
+        n = A.shape[0]
+        self.num_cells = n
+        self.cell_ids = list(range(n))
+        self.cell_id_to_idx = {i: i for i in range(n)}
+        self.conflict_matrix = csr_matrix(A)
+        self.confusion_matrix = csr_matrix(B)
+        self.interference_matrix = csr_matrix(C)
+    
+    def get_comprehensive_matrix(self):
+        """综合MR矩阵 = 冲突 + 混淆 + 干扰"""
+        return self.conflict_matrix + self.confusion_matrix + self.interference_matrix
+    
+    def compute_region_conflict_degree(self, matrix_type='comprehensive'):
+        """
+        计算每个区域的冲突度
+        matrix_type: 'comprehensive', 'conflict', 'confusion', 'interference'
+        """
+        if matrix_type == 'comprehensive':
+            M = self.get_comprehensive_matrix()
+        elif matrix_type == 'conflict':
+            M = self.conflict_matrix
+        elif matrix_type == 'confusion':
+            M = self.confusion_matrix
+        elif matrix_type == 'interference':
+            M = self.interference_matrix
+        else:
+            M = self.get_comprehensive_matrix()
+        
+        # 区域冲突度 = 该区域与所有邻域MR之和（行和+列和）
+        row_sum = np.array(M.sum(axis=1)).flatten()
+        col_sum = np.array(M.sum(axis=0)).flatten()
+        conflict_degree = row_sum + col_sum
+        return conflict_degree
+
+# ============================================================
+# 第二部分：空间分解（对数差分法）
+# ============================================================
+
+class SpaceDecomposer:
+    """基于对数差分的空间分解"""
+    
+    def __init__(self, threshold=0.5):
+        self.threshold = threshold
+        self.primary_indices = []
+        self.secondary_indices = []
+    
+    def decompose(self, conflict_degree):
+        """
+        将区域分为主要区域和次要区域
+        conflict_degree: 每个区域的冲突度数组
+        """
+        n = len(conflict_degree)
+        
+        # 按冲突度降序排列
+        sorted_indices = np.argsort(-conflict_degree)
+        sorted_values = conflict_degree[sorted_indices]
+        
+        # 过滤零值
+        nonzero_mask = sorted_values > 0
+        if np.sum(nonzero_mask) < 2:
+            self.primary_indices = sorted_indices.tolist()
+            self.secondary_indices = []
+            return self.primary_indices, self.secondary_indices
+        
+        # 对数变换
+        log_values = np.log1p(sorted_values[nonzero_mask])
+        
+        # 一阶差分
+        diff_values = np.diff(log_values)
+        
+        # 找到差分绝对值超过阈值的第一个位置
+        split_idx = len(log_values)  # 默认全部为主要区域
+        for i in range(len(diff_values)):
+            if abs(diff_values[i]) > self.threshold:
+                split_idx = i + 1
+                break
+        
+        # 确保至少有一定比例的主要区域
+        min_primary = max(10, int(0.1 * n))
+        split_idx = max(split_idx, min_primary)
+        split_idx = min(split_idx, n)
+        
+        nonzero_sorted = sorted_indices[nonzero_mask]
+        zero_sorted = sorted_indices[~nonzero_mask]
+        
+        self.primary_indices = nonzero_sorted[:split_idx].tolist()
+        self.secondary_indices = nonzero_sorted[split_idx:].tolist() + zero_sorted.tolist()
+        
+        return self.primary_indices, self.secondary_indices
+
+# ============================================================
+# 第三部分：图软着色算法
+# ============================================================
+
+class GraphSoftColoring:
+    """图软着色：为每个小区分配使冲突度最小的PCI"""
+    
+    def __init__(self, omega_matrix, num_pci=1008):
+        """
+        omega_matrix: 稀疏矩阵，记录小区间冲突度
+        num_pci: 可用PCI数量
+        """
+        self.omega = omega_matrix
+        self.num_pci = num_pci
+        self.n = omega_matrix.shape[0]
+    
+    def assign_pci(self, order, existing_pci=None, mod3_matrix=None):
+        """
+        按照给定顺序分配PCI
+        order: 分配顺序（小区索引列表）
+        existing_pci: 已有PCI分配（用于约束）
+        mod3_matrix: 干扰矩阵（用于模3优化）
+        返回: PCI分配数组
+        """
+        pci_assignment = np.full(self.n, -1, dtype=int)
+        
+        if existing_pci is not None:
+            pci_assignment = existing_pci.copy()
+        
+        for cell_idx in order:
+            if pci_assignment[cell_idx] >= 0 and existing_pci is not None:
+                continue
+            
+            # 计算每个PCI值的冲突代价
+            costs = np.zeros(self.num_pci)
+            
+            # 获取当前小区的邻居
+            row = self.omega.getrow(cell_idx)
+            col = self.omega.getcol(cell_idx)
+            
+            neighbors_row = row.nonzero()[1]
+            neighbors_col = col.nonzero()[0]
+            
+            # 对已分配PCI的邻居，计算冲突代价
+            for j in neighbors_row:
+                if pci_assignment[j] >= 0:
+                    pci_j = pci_assignment[j]
+                    # 相同PCI的冲突代价
+                    costs[pci_j] += row[0, j]
+                    # 模3干扰代价
+                    if mod3_matrix is not None:
+                        mod3_val = mod3_matrix[cell_idx, j]
+                        for p in range(self.num_pci):
+                            if p % 3 == pci_j % 3 and p != pci_j:
+                                costs[p] += mod3_val
+            
+            for i_idx in neighbors_col:
+                if pci_assignment[i_idx] >= 0:
+                    pci_i = pci_assignment[i_idx]
+                    costs[pci_i] += col[i_idx, 0]
+                    if mod3_matrix is not None:
+                        mod3_val = mod3_matrix[i_idx, cell_idx]
+                        for p in range(self.num_pci):
+                            if p % 3 == pci_i % 3 and p != pci_i:
+                                costs[p] += mod3_val
+            
+            # 选择代价最小的PCI
+            min_cost = np.min(costs)
+            best_pcis = np.where(costs == min_cost)[0]
+            pci_assignment[cell_idx] = np.random.choice(best_pcis)
+        
+        return pci_assignment
+
+# ============================================================
+# 第四部分：目标函数计算
+# ============================================================
+
+class ObjectiveFunction:
+    """目标函数计算"""
+    
+    def __init__(self, conflict_matrix, confusion_matrix, interference_matrix):
+        self.A = conflict_matrix  # 冲突矩阵
+        self.B = confusion_matrix  # 混淆矩阵
+        self.C = interference_matrix  # 干扰矩阵
+        self.n = conflict_matrix.shape[0]
+    
+    def compute_conflict_mr(self, pci):
+        """计算冲突MR"""
+        total = 0.0
+        A = self.A
+        rows, cols = A.nonzero()
+        for idx in range(len(rows)):
+            i, j = rows[idx], cols[idx]
+            if pci[i] == pci[j]:
+                total += A[i, j]
+        return total
+    
+    def compute_confusion_mr(self, pci):
+        """计算混淆MR"""
+        total = 0.0
+        B = self.B
+        rows, cols = B.nonzero()
+        for idx in range(len(rows)):
+            i, j = rows[idx], cols[idx]
+            if pci[i] == pci[j]:
+                total += B[i, j]
+        return total
+    
+    def compute_interference_mr(self, pci):
+        """计算模3干扰MR"""
+        total = 0.0
+        C = self.C
+        rows, cols = C.nonzero()
+        for idx in range(len(rows)):
+            i, j = rows[idx], cols[idx]
+            if pci[i] % 3 == pci[j] % 3:
+                total += C[i, j]
+        return total
+    
+    def compute_comprehensive_mr(self, pci):
+        """综合MR = 冲突 + 混淆 + 模3干扰"""
+        return (self.compute_conflict_mr(pci) + 
+                self.compute_confusion_mr(pci) + 
+                self.compute_interference_mr(pci))
+    
+    def compute_comprehensive_mr_fast(self, pci):
+        """快速计算综合MR（向量化）"""
+        n = self.n
+        conflict_total = 0.0
+        confusion_total = 0.0
+        interference_total = 0.0
+        
+        # 冲突矩阵
+        rows, cols = self.A.nonzero()
+        for idx in range(len(rows)):
+            i, j = rows[idx], cols[idx]
+            if pci[i] == pci[j]:
+                conflict_total += self.A[i, j]
+        
+        # 混淆矩阵
+        rows, cols = self.B.nonzero()
+        for idx in range(len(rows)):
+            i, j = rows[idx], cols[idx]
+            if pci[i] == pci[j]:
+                confusion_total += self.B[i, j]
+        
+        # 干扰矩阵
+        rows, cols = self.C.nonzero()
+        for idx in range(len(rows)):
+            i, j = rows[idx], cols[idx]
+            if pci[i] % 3 == pci[j] % 3:
+                interference_total += self.C[i, j]
+        
+        return conflict_total + confusion_total + interference_total
+
+# ============================================================
+# 第五部分：主从伴随优化算法（问题一/二）
+# ============================================================
+
+class MasterSlaveOptimizer:
+    """
+    基于空间分解与主从伴随优化的PCI综合分配
+    以模拟退火为框架
+    """
+    
+    def __init__(self, preprocessor, objective_func, num_pci=1008,
+                 T0=1000, T_min=1, alpha=0.95, max_iter=500,
+                 cum_threshold=20, con_threshold=5, omega=0.8):
+        self.preprocessor = preprocessor
+        self.obj_func = objective_func
+        self.num_pci = num_pci
+        self.n = preprocessor.num_cells
+        
+        # SA参数
+        self.T0 = T0
+        self.T_min = T_min
+        self.alpha = alpha
+        self.max_iter = max_iter
+        
+        # 扰动与终止参数
+        self.cum_threshold = cum_threshold  # 触发扰动的阈值
+        self.con_threshold = con_threshold  # 终止条件：扰动次数
+        self.omega_weight = omega  # 邻域选择惯性权重
+        
+        # 空间分解结果
+        self.primary_indices = []
+        self.secondary_indices = []
+        
+        # 软着色器
+        self.coloring = None
+        
+        # 邻域选择概率
+        self.p_k = [0.5, 0.5]  # [解变换, 随机变异]
+        self.s_k = [1, 1]  # 成功次数
+        self.st_k = [1, 1]  # 选择次数
+    
+    def setup(self, matrix_type='comprehensive', decompose_threshold=0.5):
+        """初始化：空间分解 + 软着色器"""
+        # 计算冲突度
+        conflict_degree = self.preprocessor.compute_region_conflict_degree(matrix_type)
+        
+        # 空间分解
+        decomposer = SpaceDecomposer(threshold=decompose_threshold)
+        self.primary_indices, self.secondary_indices = decomposer.decompose(conflict_degree)
+        
+        print(f"空间分解完成: 主要区域 {len(self.primary_indices)} 个, "
+              f"次要区域 {len(self.secondary_indices)} 个")
+        
+        # 构建软着色器
+        if matrix_type == 'comprehensive':
+            omega_mat = self.preprocessor.get_comprehensive_matrix()
+        elif matrix_type == 'conflict':
+            omega_mat = self.preprocessor.conflict_matrix
+        elif matrix_type == 'confusion':
+            omega_mat = self.preprocessor.confusion_matrix
+        else:
+            omega_mat = self.preprocessor.interference_matrix
+        
+        self.coloring = GraphSoftColoring(omega_mat, self.num_pci)
+        return conflict_degree
+    
+    def generate_initial_solution(self):
+        """基于分层编码与图软着色生成初始解"""
+        # 第一层：生成执行次序
+        primary_order = list(self.primary_indices)
+        random.shuffle(primary_order)
+        
+        secondary_order = list(self.secondary_indices)
+        random.shuffle(secondary_order)
+        
+        order = primary_order + secondary_order
+        
+        # 第二层：通过图软着色分配PCI
+        pci = self.coloring.assign_pci(order)
+        
+        return order, pci
+    
+    def solution_transform(self, order, pci):
+        """解变换策略：主要区域内部次序互换 + 次要区域内部次序互换"""
+        new_order = order.copy()
+        m = len(self.primary_indices)
+        n_total = len(order)
+        
+        # 主要区域内随机选两个位置互换
+        if m >= 2:
+            i1, i2 = random.sample(range(m), 2)
+            new_order[i1], new_order[i2] = new_order[i2], new_order[i1]
+        
+        # 次要区域内随机选两个位置互换
+        if n_total - m >= 2:
+            i1, i2 = random.sample(range(m, n_total), 2)
+            new_order[i1], new_order[i2] = new_order[i2], new_order[i1]
+        
+        # 根据新次序重新着色
+        new_pci = self.coloring.assign_pci(new_order)
+        return new_order, new_pci
+    
+    def random_mutation(self, order, pci):
+        """随机变异策略：主要区域与次要区域之间互换"""
+        new_order = order.copy()
+        m = len(self.primary_indices)
+        n_total = len(order)
+        
+        if m > 0 and n_total - m > 0:
+            i1 = random.randint(0, m - 1)
+            i2 = random.randint(m, n_total - 1)
+            new_order[i1], new_order[i2] = new_order[i2], new_order[i1]
+        
+        new_pci = self.coloring.assign_pci(new_order)
+        return new_order, new_pci
+    
+    def perturbation(self, order, pci):
+        """扰动策略：连续子区域次序循环移位"""
+        new_order = order.copy()
+        m = len(self.primary_indices)
+        
+        # 在主要区域中选一段连续区域循环移位
+        if m >= 3:
+            start = random.randint(0, m - 3)
+            length = random.randint(2, min(5, m - start))
+            segment = new_order[start:start + length]
+            # 循环左移
+            segment = segment[1:] + [segment[0]]
+            new_order[start:start + length] = segment
+        
+        new_pci = self.coloring.assign_pci(new_order)
+        return new_order, new_pci
+    
+    def update_neighborhood_prob(self):
+        """自适应动态邻域结构选择"""
+        w = self.omega_weight
+        for k in range(2):
+            ratio = self.s_k[k] / max(self.st_k[k], 1)
+            self.p_k[k] = w * self.p_k[k] + (1 - w) * ratio
+        
+        total = sum(self.p_k)
+        if total > 0:
+            self.p_k = [p / total for p in self.p_k]
+    
+    def adaptive_temperature(self, T_max, mu, R_i, lam):
+        """自适应温度更新: θ_i = θ_m - μ * ln(1 + R_i / λ)"""
+        return T_max - mu * math.log(1 + R_i / lam)
+    
+    def optimize(self, eval_func=None):
+        """
+        主从伴随优化主循环
+        eval_func: 目标函数，默认为综合MR
+        """
+        if eval_func is None:
+            eval_func = self.obj_func.compute_comprehensive_mr
+        
+        # 生成初始解
+        best_order, best_pci = self.generate_initial_solution()
+        best_cost = eval_func(best_pci)
+        
+        current_order, current_pci = best_order.copy(), best_pci.copy()
+        current_cost = best_cost
+        
+        print(f"初始解综合MR: {best_cost}")
+        
+        T = self.T0
+        mu = 50  # 惯性系数
+        lam = 10  # 温度调节系数
+        no_improve_count = 0  # R_i
+        perturbation_count = 0
+        
+        history = [best_cost]
+        
+        for iteration in range(self.max_iter):
+            if T < self.T_min:
+                break
+            if perturbation_count >= self.con_threshold:
+                print(f"达到扰动终止条件，迭代 {iteration} 次")
+                break
+            
+            # 自适应选择邻域结构
+            self.update_neighborhood_prob()
+            xi = random.random()
+            
+            if xi < self.p_k[0]:
+                # 解变换策略
+                new_order, new_pci = self.solution_transform(current_order, current_pci)
+                k_selected = 0
+            else:
+                # 随机变异策略
+                new_order, new_pci = self.random_mutation(current_order, current_pci)
+                k_selected = 1
+            
+            self.st_k[k_selected] += 1
+            new_cost = eval_func(new_pci)
+            delta_f = new_cost - current_cost
+            
+            # Metropolis准则
+            if delta_f < 0:
+                current_order, current_pci = new_order, new_pci
+                current_cost = new_cost
+                self.s_k[k_selected] += 1
+                
+                if current_cost < best_cost:
+                    best_order, best_pci = current_order.copy(), current_pci.copy()
+                    best_cost = current_cost
+                    no_improve_count = 0
+                else:
+                    no_improve_count += 1
+            else:
+                if T > 0 and random.random() < math.exp(-delta_f / max(T, 1e-10)):
+                    current_order, current_pci = new_order, new_pci
+                    current_cost = new_cost
+                no_improve_count += 1
+            
+            # 扰动策略
+            if no_improve_count >= self.cum_threshold:
+                per_order, per_pci = self.perturbation(best_order, best_pci)
+                per_cost = eval_func(per_pci)
+                
+                if per_cost < best_cost:
+                    best_order, best_pci = per_order, per_pci
+                    best_cost = per_cost
+                    current_order, current_pci = per_order, per_pci
+                    current_cost = per_cost
+                
+                no_improve_count = 0
+                perturbation_count += 1
+            
+            # 自适应温度更新
+            T = max(self.adaptive_temperature(self.T0, mu, no_improve_count, lam), self.T_min)
+            T *= self.alpha
+            
+            history.append(best_cost)
+            
+            if iteration % 10 == 0:
+                print(f"迭代 {iteration}: 当前最优MR = {best_cost}, 温度 = {T:.2f}")
+        
+        return best_pci, best_cost, history
+
+# ============================================================
+# 第六部分：禁忌主从伴随优化算法（问题三/四）
+# ============================================================
+
+class TabuMasterSlaveOptimizer(MasterSlaveOptimizer):
+    """
+    基于空间分解与禁忌主从伴随优化的PCI综合分配
+    在主从伴随优化基础上增加禁忌表
+    """
+    
+    def __init__(self, preprocessor, objective_func, num_pci=1008,
+                 T0=1000, T_min=1, alpha=0.95, max_iter=500,
+                 cum_threshold=20, con_threshold=5, omega=0.8,
+                 tabu_size=50):
+        super().__init__(preprocessor, objective_func, num_pci,
+                         T0, T_min, alpha, max_iter,
+                         cum_threshold, con_threshold, omega)
+        self.tabu_size = tabu_size
+        self.tabu_list = []
+    
+    def _solution_hash(self, pci):
+        """计算解的哈希值用于禁忌表"""
+        return hash(tuple(pci.tolist()))
+    
+    def is_tabu(self, pci):
+        """检查解是否在禁忌表中"""
+        h = self._solution_hash(pci)
+        return h in self.tabu_list
+    
+    def add_to_tabu(self, pci):
+        """将解加入禁忌表"""
+        h = self._solution_hash(pci)
+        self.tabu_list.append(h)
+        if len(self.tabu_list) > self.tabu_size:
+            self.tabu_list.pop(0)
+    
+    def optimize(self, eval_func=None):
+        """带禁忌搜索的主从伴随优化"""
+        if eval_func is None:
+            eval_func = self.obj_func.compute_comprehensive_mr
+        
+        best_order, best_pci = self.generate_initial_solution()
+        best_cost = eval_func(best_pci)
+        
+        current_order, current_pci = best_order.copy(), best_pci.copy()
+        current_cost = best_cost
+        self.add_to_tabu(best_pci)
+        
+        print(f"初始解MR: {best_cost}")
+        
+        T = self.T0
+        mu = 50
+        lam = 10
+        no_improve_count = 0
+        perturbation_count = 0
+        history = [best_cost]
+        
+        for iteration in range(self.max_iter):
+            if T < self.T_min or perturbation_count >= self.con_threshold:
+                break
+            
+            self.update_neighborhood_prob()
+            xi = random.random()
+            
+            if xi < self.p_k[0]:
+                new_order, new_pci = self.solution_transform(current_order, current_pci)
+                k_selected = 0
+            else:
+                new_order, new_pci = self.random_mutation(current_order, current_pci)
+                k_selected = 1
+            
+            self.st_k[k_selected] += 1
+            
+            # 禁忌检查
+            if self.is_tabu(new_pci):
+                no_improve_count += 1
+                T = max(self.adaptive_temperature(self.T0, mu, no_improve_count, lam), self.T_min)
+                T *= self.alpha
+                history.append(best_cost)
+                continue
+            
+            new_cost = eval_func(new_pci)
+            delta_f = new_cost - current_cost
+            
+            if delta_f < 0:
+                current_order, current_pci = new_order, new_pci
+                current_cost = new_cost
+                self.s_k[k_selected] += 1
+                self.add_to_tabu(new_pci)
+                
+                if current_cost < best_cost:
+                    best_order, best_pci = current_order.copy(), current_pci.copy()
+                    best_cost = current_cost
+                    no_improve_count = 0
+                else:
+                    no_improve_count += 1
+            else:
+                if T > 0 and random.random() < math.exp(-delta_f / max(T, 1e-10)):
+                    current_order, current_pci = new_order, new_pci
+                    current_cost = new_cost
+                    self.add_to_tabu(new_pci)
+                no_improve_count += 1
+            
+            if no_improve_count >= self.cum_threshold:
+                per_order, per_pci = self.perturbation(best_order, best_pci)
+                per_cost = eval_func(per_pci)
+                if per_cost < best_cost:
+                    best_order, best_pci = per_order, per_pci
+                    best_cost = per_cost
+                    current_order, current_pci = per_order, per_pci
+                    current_cost = per_cost
+                no_improve_count = 0
+                perturbation_count += 1
+            
+            T = max(self.adaptive_temperature(self.T0, mu, no_improve_count, lam), self.T_min)
+            T *= self.alpha
+            history.append(best_cost)
+            
+            if iteration % 10 == 0:
+                print(f"迭代 {iteration}: 最优MR = {best_cost}, 温度 = {T:.2f}")
+        
+        return best_pci, best_cost, history
+
+# ============================================================
+# 第七部分：分层分配求解器（问题二/四）
+# ============================================================
+
+class HierarchicalPCISolver:
+    """
+    空间层次分解与主从伴随串行优化的PCI分层分配
+    第一层：最小化冲突MR
+    第二层：最小化混淆MR（冲突MR为约束）
+    第三层：最小化模3干扰MR（冲突+混淆MR为约束）
+    """
+    
+    def __init__(self, preprocessor, use_tabu=False, **kwargs):
+        self.preprocessor = preprocessor
+        self.use_tabu = use_tabu
+        self.kwargs = kwargs
+        self.obj_func = ObjectiveFunction(
+            preprocessor.conflict_matrix,
+            preprocessor.confusion_matrix,
+            preprocessor.interference_matrix
+        )
+    
+    def solve(self):
+        """分层求解"""
+        print("=" * 60)
+        print("第一层：最小化冲突MR")
+        print("=" * 60)
+        
+        OptimizerClass = TabuMasterSlaveOptimizer if self.use_tabu else MasterSlaveOptimizer
+        
+        # 第一层：以冲突MR最小为目标
+        optimizer1 = OptimizerClass(self.preprocessor, self.obj_func, **self.kwargs)
+        optimizer1.setup(matrix_type='conflict')
+        pci_layer1, cost1, hist1 = optimizer1.optimize(
+            eval_func=self.obj_func.compute_conflict_mr
+        )
+        
+        conflict_mr_1 = self.obj_func.compute_conflict_mr(pci_layer1)
+        print(f"第一层完成: 冲突MR = {conflict_mr_1}")
+        
+        print("\n" + "=" * 60)
+        print("第二层：最小化混淆MR（保持冲突MR不增加）")
+        print("=" * 60)
+        
+        # 第二层：以混淆MR最小为目标，约束冲突MR <= 第一层结果
+        optimizer2 = OptimizerClass(self.preprocessor, self.obj_func, **self.kwargs)
+        optimizer2.setup(matrix_type='confusion')
+        
+        def eval_layer2(pci):
+            conf_mr = self.obj_func.compute_conflict_mr(pci)
+            if conf_mr > conflict_mr_1:
+                return float('inf')
+            return self.obj_func.compute_confusion_mr(pci)
+        
+        # 用第一层的结果作为初始解的基础
+        pci_layer2, cost2, hist2 = optimizer2.optimize(eval_func=eval_layer2)
+        
+        # 如果第二层没有改善，保留第一层结果
+        if self.obj_func.compute_conflict_mr(pci_layer2) > conflict_mr_1:
+            pci_layer2 = pci_layer1.copy()
+        
+        confusion_mr_2 = self.obj_func.compute_confusion_mr(pci_layer2)
+        print(f"第二层完成: 混淆MR = {confusion_mr_2}")
+        
+        print("\n" + "=" * 60)
+        print("第三层：最小化模3干扰MR（保持冲突和混淆MR不增加）")
+        print("=" * 60)
+        
+        # 第三层：以模3干扰MR最小为目标
+        optimizer3 = OptimizerClass(self.preprocessor, self.obj_func, **self.kwargs)
+        optimizer3.setup(matrix_type='interference')
+        
+        def eval_layer3(pci):
+            conf_mr = self.obj_func.compute_conflict_mr(pci)
+            confn_mr = self.obj_func.compute_confusion_mr(pci)
+            if conf_mr > conflict_mr_1 or confn_mr > confusion_mr_2:
+                return float('inf')
+            return self.obj_func.compute_interference_mr(pci)
+        
+        pci_layer3, cost3, hist3 = optimizer3.optimize(eval_func=eval_layer3)
+        
+        if (self.obj_func.compute_conflict_mr(pci_layer3) > conflict_mr_1 or
+            self.obj_func.compute_confusion_mr(pci_layer3) > confusion_mr_2):
+            pci_layer3 = pci_layer2.copy()
+        
+        # 最终结果
+        final_conflict = self.obj_func.compute_conflict_mr(pci_layer3)
+        final_confusion = self.obj_func.compute_confusion_mr(pci_layer3)
+        final_interference = self.obj_func.compute_interference_mr(pci_layer3)
+        
+        print(f"\n最终结果: 冲突MR={final_conflict}, "
+              f"混淆MR={final_confusion}, 模3干扰MR={final_interference}")
+        
+        return pci_layer3, {
+            'conflict_mr': final_conflict,
+            'confusion_mr': final_confusion,
+            'interference_mr': final_interference,
+            'history': [hist1, hist2, hist3]
+        }
+
+# ============================================================
+# 第八部分：主程序入口
+# ============================================================
+
+def solve_problem1(preprocessor, max_iter=300):
+    """问题一：基于空间分解与主从伴随优化的PCI综合分配"""
+    print("=" * 60)
+    print("问题一：PCI综合分配（特定区域，综合MR最小）")
+    print("=" * 60)
+    
+    obj_func = ObjectiveFunction(
+        preprocessor.conflict_matrix,
+        preprocessor.confusion_matrix,
+        preprocessor.interference_matrix
+    )
+    
+    optimizer = MasterSlaveOptimizer(
+        preprocessor, obj_func, max_iter=max_iter,
+        T0=1000, T_min=1, alpha=0.95
+    )
+    optimizer.setup(matrix_type='comprehensive')
+    pci, cost, history = optimizer.optimize()
+    
+    print(f"\n问题一最终综合MR: {cost}")
+    return pci, cost, history
+
+def solve_problem2(preprocessor, max_iter=300):
+    """问题二：空间层次分解与主从伴随串行优化的PCI分层分配"""
+    print("=" * 60)
+    print("问题二：PCI分层分配（特定区域，分优先级）")
+    print("=" * 60)
+    
+    solver = HierarchicalPCISolver(
+        preprocessor, use_tabu=False,
+        max_iter=max_iter, T0=1000, T_min=1, alpha=0.95
+    )
+    return solver.solve()
+
+def solve_problem3(preprocessor, max_iter=300):
+    """问题三：基于空间分解与禁忌主从伴随优化的PCI综合分配（所有区域）"""
+    print("=" * 60)
+    print("问题三：PCI综合分配（所有区域，综合MR最小）")
+    print("=" * 60)
+    
+    obj_func = ObjectiveFunction(
+        preprocessor.conflict_matrix,
+        preprocessor.confusion_matrix,
+        preprocessor.interference_matrix
+    )
+    
+    optimizer = TabuMasterSlaveOptimizer(
+        preprocessor, obj_func, max_iter=max_iter,
+        T0=1000, T_min=1, alpha=0.95, tabu_size=50
+    )
+    optimizer.setup(matrix_type='comprehensive')
+    pci, cost, history = optimizer.optimize()
+    
+    print(f"\n问题三最终综合MR: {cost}")
+    return pci, cost, history
+
+def solve_problem4(preprocessor, max_iter=300):
+    """问题四：空间层次分解与禁忌主从伴随串行优化的PCI分层分配（所有区域）"""
+    print("=" * 60)
+    print("问题四：PCI分层分配（所有区域，分优先级）")
+    print("=" * 60)
+    
+    solver = HierarchicalPCISolver(
+        preprocessor, use_tabu=True,
+        max_iter=max_iter, T0=1000, T_min=1, alpha=0.95, tabu_size=50
+    )
+    return solver.solve()
+
+# ============================================================
+# 第九部分：可视化工具
+# ============================================================
+
+def plot_results(history, title="收敛曲线"):
+    """绘制收敛曲线"""
+    try:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(10, 6))
+        plt.plot(history, 'b-', linewidth=1.5)
+        plt.xlabel('迭代次数')
+        plt.ylabel('综合MR')
+        plt.title(title)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f'{title}.png', dpi=150)
+        plt.show()
+    except ImportError:
+        print("matplotlib未安装，跳过绘图")
+
+def save_pci_result(pci, cell_ids, filename='pci_result.csv'):
+    """保存PCI分配结果"""
+    df = pd.DataFrame({
+        '小区': cell_ids,
+        'PCI': pci
+    })
+    df.to_csv(filename, index=False, encoding='utf-8-sig')
+    print(f"结果已保存至 {filename}")
+
+# ============================================================
+# 运行示例
+# ============================================================
+
+if __name__ == '__main__':
+    # ---- 方式1：使用随机数据测试 ----
+    print("使用随机数据进行测试...")
+    np.random.seed(42)
+    n = 100  # 小区数量（测试用小规模）
+    
+    # 生成稀疏的测试矩阵
+    A = np.zeros((n, n))
+    B = np.zeros((n, n))
+    C = np.zeros((n, n))
+    
+    for i in range(n):
+        for j in range(i + 1, min(i + 10, n)):  # 邻近小区才有MR
+            if random.random() < 0.3:
+                A[i][j] = random.randint(0, 1000)
+                A[j][i] = random.randint(0, 1000)
+            if random.random() < 0.2:
+                B[i][j] = random.randint(0, 500)
+                B[j][i] = random.randint(0, 500)
+            if random.random() < 0.4:
+                C[i][j] = random.randint(0, 5000)
+                C[j][i] = random.randint(0, 5000)
+    
+    preprocessor = DataPreprocessor(num_cells=n)
+    preprocessor.load_data_from_arrays(A, B, C)
+    
+    # 求解问题一
+    pci1, cost1, hist1 = solve_problem1(preprocessor, max_iter=100)
+    plot_results(hist1, "问题一收敛曲线")
+    save_pci_result(pci1, preprocessor.cell_ids, 'problem1_result.csv')
+    
+    # 求解问题二
+    pci2, results2 = solve_problem2(preprocessor, max_iter=50)
+    save_pci_result(pci2, preprocessor.cell_ids, 'problem2_result.csv')
+    
+    # 求解问题三（禁忌搜索版本）
+    pci3, cost3, hist3 = solve_problem3(preprocessor, max_iter=100)
+    plot_results(hist3, "问题三收敛曲线")
+    save_pci_result(pci3, preprocessor.cell_ids, 'problem3_result.csv')
+    
+    # 求解问题四
+    pci4, results4 = solve_problem4(preprocessor, max_iter=50)
+    save_pci_result(pci4, preprocessor.cell_ids, 'problem4_result.csv')
+    
+    # ---- 方式2：使用真实数据文件 ----
+    preprocessor = DataPreprocessor()
+    preprocessor.load_data(
+        conflict_file='附件1_冲突干扰数据.csv',
+        confusion_file='附件2_混淆数据.csv',
+        interference_file='附件1_冲突干扰数据.csv',  # 干扰列在同一文件
+        cell_list_file='附件3_优化小区列表.csv'
+    )
+    pci1, cost1, hist1 = solve_problem1(preprocessor, max_iter=300)
