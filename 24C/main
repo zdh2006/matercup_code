@@ -1,0 +1,12 @@
+import numpy as np
+import pandas as pd
+import warnings
+import os
+from scipy import linalg
+from scipy.optimize import minimize
+
+warnings.filterwarnings('ignore')# 解决文件找不到问题的核心
+
+PREDICT_DAYS = 30
+SHIFTS = 6
+SHIFTS_HOURS = 8

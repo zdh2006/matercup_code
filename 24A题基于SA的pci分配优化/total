@@ -53,15 +53,18 @@ class DataPreprocessor:
         interference_data = defaultdict(float)
         
         # 读取冲突及干扰数据
+        #读取逻辑：先读索引，然后确实是否为优化对象，接着继续读冲突MR和干扰MR，最后存储到对应的字典中
         cf_df = pd.read_csv(conflict_file)
         for _, row in cf_df.iterrows():
-            cell_i = row.iloc[0]#
-            cell_j = row.iloc[1]
-            if cell_i in self.cell_id_to_idx and cell_j in self.cell_id_to_idx:
-                i = self.cell_id_to_idx[cell_i]
+            #每次迭代返回一个包含行索引和行数据的元组 (index, Series)，其中行数据以 pandas.Series 对象的形式存在。
+            cell_i = row.iloc[0]#行数据的第一个元素，也就是小区i的ID
+            cell_j = row.iloc[1]#行数据的第二个元素，也就是小区j的ID
+            if cell_i in self.cell_id_to_idx and cell_j in self.cell_id_to_idx:#约束条件：只有当小区i和小区j都在优化小区列表中时，才处理这条数据，符合题目要求只优化部分小区的PCI分配
+                i = self.cell_id_to_idx[cell_i]#i是小区i在矩阵中的索引位置，通过cell_id_to_idx字典将小区ID转换为对应的索引
                 j = self.cell_id_to_idx[cell_j]
                 conflict_data[(i, j)] = row.iloc[2]  # 冲突MR
                 interference_data[(i, j)] = row.iloc[3]  # 干扰MR
+                #注意，interference_data的键也是(i, j)，值是干扰MR，它的初始化不是列表是字典
         
         # 读取混淆数据
         cn_df = pd.read_csv(confusion_file)
@@ -74,10 +77,11 @@ class DataPreprocessor:
                 confusion_data[(i, j)] = row.iloc[2]
         
         # 补全：混淆矩阵有但冲突矩阵没有的
+        #这里可以直接补全，是因为前面这个数组的定义为defaultdict(float)，所以不存在键不存在的报错终止程序
         for (i, j), v in confusion_data.items():
             if (i, j) not in conflict_data:
                 conflict_data[(i, j)] = 0
-                interference_data[(i, j)] = 0
+                interference_data[(i, j)] = 0#遍历检验处理
         
         for (i, j), v in conflict_data.items():
             if (i, j) not in confusion_data:
@@ -87,14 +91,14 @@ class DataPreprocessor:
         rows_c, cols_c, vals_c = [], [], []
         rows_n, cols_n, vals_n = [], [], []
         rows_i, cols_i, vals_i = [], [], []
-        
-        for (i, j), v in conflict_data.items():
-            rows_c.append(i); cols_c.append(j); vals_c.append(v)
+        #解析
+        for (i, j), v in conflict_data.items():#.items不更新字典，返回（key,value）对的迭代器，适合在循环中使用
+            rows_c.append(i); cols_c.append(j); vals_c.append(v)#将冲突数据的键值对(i, j)和对应的冲突MR值v分别存储到rows_c、cols_c和vals_c三个列表中，准备构建稀疏矩阵
         for (i, j), v in confusion_data.items():
             rows_n.append(i); cols_n.append(j); vals_n.append(v)
         for (i, j), v in interference_data.items():
             rows_i.append(i); cols_i.append(j); vals_i.append(v)
-        
+        #构造
         self.conflict_matrix = csr_matrix((vals_c, (rows_c, cols_c)), shape=(n, n))
         self.confusion_matrix = csr_matrix((vals_n, (rows_n, cols_n)), shape=(n, n))
         self.interference_matrix = csr_matrix((vals_i, (rows_i, cols_i)), shape=(n, n))
@@ -144,22 +148,22 @@ class SpaceDecomposer:
     
     def __init__(self, threshold=0.5):
         self.threshold = threshold
-        self.primary_indices = []
-        self.secondary_indices = []
+        self.primary_indices = []#主要区域小区索引列表
+        self.secondary_indices = []#次要区域小区索引列表
     
     def decompose(self, conflict_degree):
         """
         将区域分为主要区域和次要区域
         conflict_degree: 每个区域的冲突度数组
         """
-        n = len(conflict_degree)
+        n = len(conflict_degree)#n是小区数量，通过计算conflict_degree数组的长度来获取，因为每个元素对应一个小区的冲突度，所以长度就是小区数量
         
         # 按冲突度降序排列
-        sorted_indices = np.argsort(-conflict_degree)
-        sorted_values = conflict_degree[sorted_indices]
-        
+        sorted_indices = np.argsort(-conflict_degree)#np.argsort(-conflict_degree)返回一个数组，表示conflict_degree数组中元素从大到小排序后的索引位置，-conflict_degree是为了实现降序排序
+        sorted_values = conflict_degree[sorted_indices]#根据排序后的索引位置重新排列conflict_degree数组，得到一个新的数组sorted_values，其中元素按照冲突度从大到小的顺序排列
+        #numpy的花式索引
         # 过滤零值
-        nonzero_mask = sorted_values > 0
+        nonzero_mask = sorted_values > 0#创建一个布尔数组nonzero_mask，表示sorted_values数组中哪些元素大于0，即哪些区域的冲突度非零，这样可以在后续的对数变换和差分计算中只考虑非零冲突度的区域，避免对数变换时出现负无穷或无定义的情况
         if np.sum(nonzero_mask) < 2:
             self.primary_indices = sorted_indices.tolist()
             self.secondary_indices = []
@@ -167,7 +171,8 @@ class SpaceDecomposer:
         
         # 对数变换
         log_values = np.log1p(sorted_values[nonzero_mask])
-        
+        #loglp1p是numpy中的一个函数，计算log(1 + x)，其中x是输入数组的元素，这样可以避免对数变换时出现负无穷或无定义的情况，因为log(0)是负无穷，而log(1 + 0)是0，所以使用log1p可以安全地处理零值和小值的情况
+        #返回一个新的数组log_values，其中每个元素是对应的sorted_values数组中非零元素经过log(1 + x)变换后的结果，这样就得到了冲突度的对数变换值，后续可以通过这些值来计算差分并进行空间分解
         # 一阶差分
         diff_values = np.diff(log_values)
         
@@ -261,6 +266,7 @@ class GraphSoftColoring:
             min_cost = np.min(costs)
             best_pcis = np.where(costs == min_cost)[0]
             pci_assignment[cell_idx] = np.random.choice(best_pcis)
+            #np.where(...) 返回满足条件的元素的索引（元组形式，第一个元素是索引数组）。[0] 取出这个索引数组，即所有达到最优成本的 PCI 编号（假设索引就是 PCI 值）。
         
         return pci_assignment
 
@@ -527,10 +533,10 @@ class MasterSlaveOptimizer:
                 break
             
             # 自适应选择邻域结构
-            self.update_neighborhood_prob()
-            xi = random.random()
+            self.update_neighborhood_prob()#更新邻域选择概率，根据之前的成功率调整解变换策略和随机变异策略的选择概率，使得在搜索过程中能够动态适应不同阶段的需求，增加算法的灵活性和效率
+            xi = random.random()#xi是一个0到1之间的随机数，用于根据自适应概率选择解变换策略或随机变异策略，通过比较xi和p_k[0]的大小来决定使用哪种策略，这样可以动态调整搜索过程中的邻域结构选择，增加算法的多样性和适应性
             
-            if xi < self.p_k[0]:
+            if xi < self.p_k[0]:#分类条件，根据自适应概率选择解变换策略或随机变异策略
                 # 解变换策略
                 new_order, new_pci = self.solution_transform(current_order, current_pci)
                 k_selected = 0
@@ -539,7 +545,7 @@ class MasterSlaveOptimizer:
                 new_order, new_pci = self.random_mutation(current_order, current_pci)
                 k_selected = 1
             
-            self.st_k[k_selected] += 1
+            self.st_k[k_selected] += 1#记录选择次数
             new_cost = eval_func(new_pci)
             delta_f = new_cost - current_cost
             
@@ -562,7 +568,7 @@ class MasterSlaveOptimizer:
                 no_improve_count += 1
             
             # 扰动策略
-            if no_improve_count >= self.cum_threshold:
+            if no_improve_count >= self.cum_threshold:#当连续迭代没有改进的次数达到cum_threshold时，触发扰动策略，通过扰动当前最优解来跳出局部最优，增加搜索的多样性和全局探索能力
                 per_order, per_pci = self.perturbation(best_order, best_pci)
                 per_cost = eval_func(per_pci)
                 
@@ -961,9 +967,9 @@ if __name__ == '__main__':
     # ---- 方式2：使用真实数据文件 ----
     preprocessor = DataPreprocessor()
     preprocessor.load_data(
-        conflict_file='附件1_冲突干扰数据.csv',
-        confusion_file='附件2_混淆数据.csv',
-        interference_file='附件1_冲突干扰数据.csv',  # 干扰列在同一文件
-        cell_list_file='附件3_优化小区列表.csv'
+        conflict_file='附件2：冲突及干扰矩阵数据',
+        confusion_file='附件3：混淆矩阵数据',
+        interference_file='附件2：冲突及干扰矩阵数据',  # 干扰列在同一文件
+        cell_list_file='附件1：小区基本信息'
     )
     pci1, cost1, hist1 = solve_problem1(preprocessor, max_iter=300)
